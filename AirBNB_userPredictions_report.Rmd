@@ -1,0 +1,264 @@
+---
+title: "What User Actions Predict AirBNB Bookings"
+author: "Tom Boatwright"
+date: "March 1, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width=12, fig.height=8,
+                      echo=FALSE, warning=FALSE, message=FALSE)
+library(reshape2)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(scales)
+library(gridExtra)
+
+## load data
+if (!exists("dfSessions")){
+  dfSessions <- read.csv("../data/sessions.csv")
+}
+
+df_train <- read.csv("../data/train_users_2.csv")
+
+######################################################################################################
+## How does the "contact_host" action relate to bookings?
+
+# filter users who did book
+df_book <- filter(df_train, !(country_destination %in% c("NDF")))
+users_book <- df_book$id
+
+# filter users who did not book
+df_NDF <- filter(df_train, (country_destination %in% c("NDF")))
+users_NDF <- df_NDF$id
+
+users_all <- c(as.character(users_book), as.character(users_NDF))
+
+
+######################################################################################################
+## filter out "contact_host" in action_detail
+df_sessions_train <- filter(dfSessions, user_id %in% users_all)
+df_sessions_train$travel <- 1
+df_sessions_train[df_sessions_train$user_id %in% users_NDF, "travel"] <- 0
+
+```
+
+## Introduction
+
+AirBNB is interested in using data analysis and machine learning techniques to predict which country each user is most likely to visit. To engage the data science community about its technical challenges, AirBNB publicly released a data set which represents user data and user travel outcomes on [Kaggle](https://www.kaggle.com/c/airbnb-recruiting-new-user-bookings), a data science competition website.  This report is a brief overview of the data set and a predictive model applied to the data.
+
+This report is structure as follows. First, the data provided by AirBNB will be briefly described.  Next, the data will be explored to find trends and define a strategy to develop a predictive model.  Then a predictive model using boosted trees (XGBoost) will be demonstrated in R.  Finally, results of the model will be displayed.
+
+## Data Description and Exploration
+
+The main file provided contains data from `r paste(length(unique(df_train$id)))` users in the United States and the countries to which they traveled. Additionally some descriptive attributes are included such as age, gender, date of account creation, browser used, etc. Below is a small subset of the data:
+
+```{r, echo=TRUE}
+head(df_train)
+```
+
+The countries traveled to are listed in the "country-destination" column.  The distribution of countries traveled to is highly asymmetric, with the majority of users choosing not to travel ("NDF" indicates the user did not travel anywhere with AirBNB).  See the plot in figure \ref{fig:country-frequency} below.
+
+```{r plot-ref, fig.cap = "Frequency of country destinations\\label{fig:country-frequency}", echo=FALSE}
+## plot a bar graph of country frequency
+
+# arrange bars by frequency
+country_count <- table(df_train$country_destination)
+country_count <- country_count[order(country_count, decreasing = TRUE)]
+df_train$country_destination <- factor(df_train$country_destination, levels = names(country_count))
+
+# which users travel?
+df_train$travel <- "travel"
+df_train$travel[df_train$country_destination %in% "NDF"] <- "no travel"
+df_train$travel <- as.factor(df_train$travel)
+
+q <- ggplot(data = df_train, aes(x = country_destination, fill = travel))
+q <- q + geom_bar() + scale_fill_brewer(palette = 'Set2') + #+ scale_y_sqrt() #
+  xlab("Country Destination Code") + ylab("Number of users") +
+  theme(text = element_text(size=16)) + theme(legend.title = element_blank())
+print(q)
+```
+
+Age was found to be very predictive of which country users booked in.  As shown below, younger users (age 25 to 40) tend to use the AirBNB website more frequently. Considering the ratio of users at each age that traveled, there is a peak in the early 30's.  That peak flattens off and may increase again, but there are low statistics after age 60.
+
+```{r age-hist, echo=FALSE}
+## plot a bar graph of country frequency
+
+q <- ggplot(data = df_train, aes(x = age, fill = travel))
+q <- q + geom_histogram(binwidth = 5, position = "dodge") + scale_fill_brewer(palette = 'Set2') + #+ scale_y_sqrt() #
+  xlab("Age") + ylab("Number of users") + xlim(c(18,80)) +
+  theme(text = element_text(size=16)) + theme(legend.title = element_blank()) +
+  facet_wrap(~travel)
+print(q)
+```
+
+```{r age-freq, echo=FALSE}
+
+df_age <- select(df_train, travel, age)
+df_age_m <- melt(df_age, id = c("age"))
+df_age_agg <- ddply(df_age_m, .(age), summarize, travelCount = sum(value == "travel"), noTravelCount = sum(value == "no travel"))
+df_age_agg <- mutate(df_age_agg, travelRatio = travelCount / (travelCount + noTravelCount))
+
+q <- ggplot(data = df_age_agg, aes(x = age, y = travelRatio, size = travelCount)) + xlim(c(18,80))
+q + geom_point(alpha = 0.5) +
+  theme(text = element_text(size=16)) + 
+  scale_size_continuous(name = "Number of travelers") +
+  #theme(legend.title=c("Number of users")) + 
+  xlab("age") + ylab("Fraction of users that traveled")
+```
+
+
+In addition to this data set, another set consisting of records of users sessions on the website.  This database contains actions taken by the user, "action details", "action types", "device types", and time elapsed. These data are sometimes correlated to user travel preferences.  For instance, in the user action details, the "your trips" action detail is highly predicted with travel, while the "update listing" is anti-correlated with traveling. The plot below shows how these action details are correlated to whether or not the user traveled or not.
+
+```{r action_details, echo=FALSE}
+## plot frequency of each action by action detail
+df_sessions_train$travel <- factor(df_sessions_train$travel, labels = c("no travel", "travel"))
+
+## plot frequency by action detail (only high frequency ones)
+act_detail_freq <- table(df_sessions_train$action_detail)
+ix_detail_freq <- order(act_detail_freq, decreasing = TRUE)
+act_detail_freq <- act_detail_freq[ix_detail_freq]
+act_detail_sel <- act_detail_freq[1:30]
+
+# remove columns that are unclear
+act_detail_sel <- act_detail_sel[!(names(act_detail_sel) %in% c("", "p3", "-unknown-"))]
+
+df_act_det_sel <- filter(df_sessions_train, action_detail %in% names(act_detail_sel))
+df_act_det_sel$action_detail <- factor(df_act_det_sel$action_detail, levels = names(act_detail_sel))
+# df_act_det_sel$travel <- factor(df_act_det_sel$travel, levels = c("no travel", "travel"))
+q <- ggplot(data = df_act_det_sel, aes(action_detail, fill = travel))
+q <- q + geom_bar(position = "dodge", width = 0.5) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  theme(text = element_text(size=16)) + 
+  theme(legend.title=element_blank()) +
+  #scale_y_sqrt(labels = comma) + 
+  scale_fill_brewer(palette = "Set2")
+
+q1 <- q + scale_y_log10(labels = comma) + ggtitle("Action Detail - log scale") + theme(legend.position="bottom")
+
+q2 <- q + scale_y_continuous(labels = comma) + ggtitle("Action Detail - linear scale") + theme(legend.position="bottom")
+
+grid.arrange(q1, q2, ncol = 2)
+```
+
+
+The same plot but with action types is shown below.  As one would expect, "booking request" is highly correlated with travel compared to the other action types. Also, "view," "data," and "click" action types are much more frequent than booking_request, as you would expect since users will spend most of the time browsing instead of booking.
+
+```{r action_type, echo=FALSE}
+
+## plot frequency of each action by action detail
+df_sessions_train$travel <- factor(df_sessions_train$travel, labels = c("no travel", "travel"))
+
+## plot frequency by action type (only high frequency ones)
+act_type_freq <- table(df_sessions_train$action_type)
+ix_type_freq <- order(act_type_freq, decreasing = TRUE)
+act_type_freq <- act_type_freq[ix_type_freq]
+act_type_sel <- act_type_freq[1:min(c(30, length(act_type_freq)))]
+
+# remove columns that are unclear
+act_type_sel <- act_type_sel[!(names(act_type_sel) %in% c("", "p3", "-unknown-"))]
+
+df_act_det_sel <- filter(df_sessions_train, action_type %in% names(act_type_sel))
+df_act_det_sel$action_type <- factor(df_act_det_sel$action_type, levels = names(act_type_sel))
+# df_act_det_sel$travel <- factor(df_act_det_sel$travel, levels = c("no travel", "travel"))
+q <- ggplot(data = df_act_det_sel, aes(action_type, fill = travel))
+q <- q + geom_bar(position = "dodge", width = 0.5) +
+  theme(text = element_text(size=16)) + 
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  theme(legend.title=element_blank()) +
+  #scale_y_sqrt(labels = comma) + 
+  scale_fill_brewer(palette = "Set2")
+# print(q)
+
+q1 <- q + scale_y_log10(labels = comma) + ggtitle("Action Type - log scale") + theme(legend.position="bottom")
+
+q2 <- q + scale_y_continuous(labels = comma) + ggtitle("Action Type - linear scale") + theme(legend.position="bottom")
+
+grid.arrange(q1, q2, ncol = 2)
+```
+
+Device types are also listed below.  It appears that users are more likely to book on desktops than mobile devices; notice that iPhones and Android phones have significantly higher rates of "no travel".  Tablets seem to do a bit better than phones, but not quite as frequent as desktops.  Also of interest, Apple products seem to be much more popular among AirBNB users than their competitors.  For instance, iPhones are much more highly represented compared to Android phones.  Windows phones are almost entirely unused.
+
+```{r device_type, echo=FALSE}
+
+## plot frequency of each action by action detail
+df_sessions_train$travel <- factor(df_sessions_train$travel, labels = c("no travel", "travel"))
+
+## plot frequency by action type (only high frequency ones)
+dev_type_freq <- table(df_sessions_train$device_type)
+ix_type_freq <- order(dev_type_freq, decreasing = TRUE)
+dev_type_freq <- dev_type_freq[ix_type_freq]
+dev_type_sel <- dev_type_freq[1:min(c(30, length(dev_type_freq)))]
+
+# remove columns that are unclear
+dev_type_sel <- dev_type_sel[!(names(dev_type_sel) %in% c("", "p3", "-unknown-"))]
+
+df_dev_det_sel <- filter(df_sessions_train, device_type %in% names(dev_type_sel))
+df_dev_det_sel$device_type <- factor(df_dev_det_sel$device_type, levels = names(dev_type_sel))
+# df_dev_det_sel$travel <- factor(df_act_det_sel$travel, levels = c("no travel", "travel"))
+q <- ggplot(data = df_dev_det_sel, aes(device_type, fill = travel))
+q <- q + geom_bar(position = "dodge", width = 0.5) +
+  theme(text = element_text(size=16)) + 
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  theme(legend.title=element_blank()) +
+  #scale_y_sqrt(labels = comma) + 
+  scale_fill_brewer(palette = "Set2")
+
+q1 <- q + scale_y_log10(labels = comma) + ggtitle("Device Type - log scale") + theme(legend.position="bottom")
+
+q2 <- q + scale_y_continuous(labels = comma) + ggtitle("Device Type - linear scale") + theme(legend.position="bottom")
+
+grid.arrange(q1, q2, ncol = 2)
+
+```
+
+## Feature Extraction
+
+The plots above show that user actions can be predictive as to whether or not they choose to travel or not.  To capture this information in a feature, I counted the occurrences of each action/action type/action detail/device type in the session information file. A feature was created for each user with this count information.
+
+In addition, the seconds elapsed between each action could be predictive.  Some basic statistical quantities of the seconds elapsed including the sum, mean, standard deviation, maximum, minimum, and number of entries were computed and formed into feature vectors.
+
+## Prediction Method
+
+Decision tree methods proved themselves to be favorable for this data set due to the moderate number of samples and features.  After experimenting with random forests, I settled on using the popular **XGBoost** package to implement gradient boosting in R.  XGBoost is convenient in that it is fast and produces more accurate results than other classifier algorithms. Conveniently, there is also a built-in method to plot the most useful features.  A plot of these features is shown below.  Notice that the user age is highly predictive of where the user will travel.
+
+![plot of feature importance](images/feature_importance.png)
+
+There are a number of [parameters that can be optimized in XGBoost](https://github.com/dmlc/xgboost/blob/master/doc/parameter.md) (see the link for more details). A good way to optimize them is through cross validation using a data set untouched during the training phase, typically called a validation set.  This was done to optimize the parameters below:
+
+* eta: step shrinkage which prevents overfitting
+* gamma: minimum loss reduction required to make another split in a tree
+* max_depth: maximum depth of a tree
+* lambda: regularization on weights
+
+After optimization of these parameters, the model was trained on 100% of the training set.  Predictions were then made on the test set, which did not contain any country codes.  The competition allowed up to 5 predictions for each user.  Each prediction was weighted by the order in which it was listed via the [normalized discounted cumulative gain](https://www.kaggle.com/wiki/NormalizedDiscountedCumulativeGain).  The basic idea behind this performance rating system is that if the first prediction is correct, a score of 1 is returned. If none of the predictions are correct, a 0 is returned.  However, if one of the other predictions is returned, a score between 0 and 1 is returned based on the ordered ranking of the prediction.  The highest score achieved with the method described here on the public leaderboard was 0.88094.
+
+## Kaggle Leaderboard
+
+The [final kaggle leaderboard results](https://www.kaggle.com/c/airbnb-recruiting-new-user-bookings/leaderboard) are freely available. For reference as to how well this method worked, see the histogram of scores below.  The green vertical line indicates the top score with this method.
+
+```{r echo=FALSE}
+## compute leaderboard histogram
+file_path <- file.path("L:\\Ideas\\kaggle_AirBNB\\scriptsR\\leaderboard", "airbnb-recruiting-new-user-bookings_public_leaderboard.csv")
+df_leaderboard <- read.csv(file_path)
+names(df_leaderboard) <- c("TeamId", "TeamName", "SubmissionDate", "Score")
+
+# get the maximum score by each user
+df_agg_leader <- ddply(df_leaderboard, .(TeamId, TeamName), summarize, maxScore = max(Score))
+
+# filter out the very low scores
+df_agg_leader_sel <- filter(df_agg_leader, maxScore > 0.7)
+
+# plot a histogram of the scores
+myScore <- filter(df_agg_leader_sel, TeamName == "Tom Boatwright")$maxScore
+q <- ggplot(data = df_agg_leader_sel, aes(x = maxScore))
+q + geom_histogram(binwidth = 0.001) + scale_y_sqrt() + geom_vline(xintercept = myScore, col = 'green') +
+  xlab("top user score") + ylab("number of users in bin")
+```
+
+
+## Summary
+
+AirBNB was kind enough to provide a data set which Kaggle users could explore.  Based on the forums, most users used the **XGBoost** gradient boosting classifier.  This report detailed one implementation of this algorithm. More important than the classifier is the features used in the model.  Several of the top competitors trained their models on over 1000 features, which put them higher on the leaderboard than the model described here.  Cross validation is similarly important for optimizing the parameters in XGBoost.  A further method of improving one's score is with ensemble methods, which were not described here.
